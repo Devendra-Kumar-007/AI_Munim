@@ -39,9 +39,11 @@ import {
   DocumentType
 } from '../../types/accounting.ts';
 import { validateGstin, formatINR } from '../../utils/accounting.ts';
+import { IntegrationsSettingsView } from './IntegrationsSettingsView.tsx';
 
 interface SettingsViewProps {
   state: AppState;
+  onShowToast?: (msg: string) => void;
   onUpdateCompany: (company: any) => void;
   onToggleUser: (index: number) => void;
   onAddUser: (name: string, email: string, role: UserRole) => void;
@@ -70,6 +72,7 @@ interface SettingsViewProps {
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   state,
+  onShowToast,
   onUpdateCompany,
   onToggleUser,
   onAddUser,
@@ -90,7 +93,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onToggleParty
 }) => {
   const [mainTab, setMainTab] = useState<
-    'masters' | 'db' | 'company' | 'users' | 'audit'
+    'masters' | 'integrations' | 'db' | 'company' | 'users' | 'audit'
   >('masters');
 
   // Masters active category
@@ -337,6 +340,18 @@ CREATE INDEX idx_documents_awaiting_approval
         >
           <ListTree className="w-4 h-4" />
           <span>Dropdown Masters Setup</span>
+        </button>
+
+        <button
+          onClick={() => setMainTab('integrations')}
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-lg transition-colors ${
+            mainTab === 'integrations'
+              ? 'bg-teal-600 text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Zap className="w-4 h-4" />
+          <span>Cloud Integrations</span>
         </button>
 
         <button
@@ -936,6 +951,13 @@ CREATE INDEX idx_documents_awaiting_approval
             )}
           </div>
         </div>
+      )}
+
+      {/* =========================================================================
+          TAB: CLOUD INTEGRATIONS (NEONDB, MULTI-AI, CLOUDINARY, GMAIL)
+          ========================================================================= */}
+      {mainTab === 'integrations' && (
+        <IntegrationsSettingsView onShowToast={onShowToast} />
       )}
 
       {/* =========================================================================

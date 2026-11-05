@@ -941,6 +941,7 @@ export default function App() {
             {currentTab === 'settings' && (
               <SettingsView
                 state={state}
+                onShowToast={showToast}
                 onUpdateCompany={handleUpdateCompany}
                 onToggleUser={handleToggleUser}
                 onAddUser={handleAddUser}

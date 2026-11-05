@@ -1,13 +1,19 @@
+import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { accountingEngine } from './src/db/concurrencyEngine.ts';
 import { formatINR, getEligibleItc, calculateCashForecast } from './src/utils/accounting.ts';
+import { askMultiAi } from './api/_lib/ai-provider.ts';
+import { uploadToCloudinary } from './api/_lib/cloudinary.ts';
+import { sendEmail, verifySmtp } from './api/_lib/email.ts';
+import { getIntegrations, saveIntegrations, saveAppState, getAppState } from './api/_lib/db.ts';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // --- SSE CLIENTS FOR REAL-TIME STREAMING ---
 const sseClients: Response[] = [];
@@ -310,96 +316,133 @@ app.post('/api/benchmark', (req: Request, res: Response) => {
   res.json(result);
 });
 
-// Grounded AI Natural Language Assistant
-app.post('/api/ai/ask', (req: Request, res: Response) => {
-  const { question } = req.body;
+// Multi-AI Assistant (OpenAI + Gemini + Deterministic)
+app.post('/api/ai/ask', async (req: Request, res: Response) => {
+  const { question, provider, apiKey, model } = req.body;
   const state = accountingEngine.getState();
   const qLower = (question || '').toLowerCase();
 
-  let answer = '';
-  let basis = '';
-  let sources: string[] = [];
+  try {
+    const aiResult = await askMultiAi(question, state, { provider, apiKey, model });
+    accountingEngine.logAction(
+      `AI Munim (${aiResult.providerUsed})`,
+      `Answered question: "${(question || '').slice(0, 45)}"`,
+      'system'
+    );
+    broadcastStateUpdate();
 
-  const eligibleItc = getEligibleItc(state.gstRows);
-  const netGst = Math.max(0, state.salesTaxOutput - eligibleItc);
-
-  if (/overdue|customer|receivable|chase/.test(qLower)) {
-    const overdueList = state.receivables
-      .filter(r => r.overdueDays > 0)
-      .sort((a, b) => b.amount * b.overdueDays - a.amount * a.overdueDays);
-
-    answer = overdueList
-      .map(
-        r =>
-          `• ${r.customer} (${r.id}): ${formatINR(r.amount)} — overdue by ${r.overdueDays} days ${
-            r.isDisputed
-              ? '[DISPUTED]'
-              : r.promiseDays !== null
-              ? `(Promise in +${r.promiseDays} days)`
-              : '(No promise captured)'
-          }`
-      )
-      .join('\n');
-
-    basis = `Ranked by overdue severity (Amount × Overdue Days). Disputed invoices are tracked separately.`;
-    sources = overdueList.map(r => r.id);
-  } else if (/cash|sufficient|enough|30\s*day|burn/.test(qLower)) {
-    const baseForecast = calculateCashForecast(state.cashBalance, state.receivables, state.payables, 'base', state.salesTaxOutput, eligibleItc);
-    const cautiousForecast = calculateCashForecast(state.cashBalance, state.receivables, state.payables, 'cautious', state.salesTaxOutput, eligibleItc);
-
-    answer = `Book Cash Balance: ${formatINR(state.cashBalance)}\n` +
-      `Base Scenario Low Point: ${formatINR(baseForecast.lowestCash)} on Day +${baseForecast.lowestDay}\n` +
-      `Cautious Scenario: ${
-        cautiousForecast.lowestCash < 0
-          ? `Cash deficit of ${formatINR(cautiousForecast.lowestCash)} projected around Day +${cautiousForecast.lowestDay}. Recommendation: Stagger supplier payments or chase top 2 overdue accounts.`
-          : `Adequate liquidity. Projected low point of ${formatINR(cautiousForecast.lowestCash)}.`
-      }`;
-
-    basis = `30-day projection modeling receivables inflow timing, scheduled supplier payables, statutory GST payment on Day 17 (${formatINR(netGst)}), and fixed payroll on Day 25 (₹2,60,000).`;
-    sources = ['Cash Forecast Engine', 'Open Receivables', 'Open Payables'];
-  } else if (/gst|liability|tax|itc|2b/.test(qLower)) {
-    answer = `Estimated Net GST Liability: ${formatINR(netGst)}\n` +
-      `• Output GST on Sales: ${formatINR(state.salesTaxOutput)}\n` +
-      `• Eligible ITC (Matched/Resolved GSTR-2B): ${formatINR(eligibleItc)}\n` +
-      `• Book ITC before reconciliation: ${formatINR(state.gstRows.reduce((acc, r) => acc + (r.booksTax || 0), 0))}`;
-
-    basis = `Calculated in compliance with Section 16(2)(aa) of CGST Act. Only matched or resolved portal invoices count towards eligible ITC. Working paper is not a filed return.`;
-    sources = state.gstRows.map(r => r.docNo);
-  } else if (/payment|payables|supplier|due|week/.test(qLower)) {
-    const due7 = state.payables.filter(p => p.dueInDays <= 7);
-    const totalDue = due7.reduce((sum, p) => sum + p.amount, 0);
-
-    answer = due7.length > 0
-      ? due7.map(p => `• ${p.supplier} (${p.id}): ${formatINR(p.amount)} due in ${p.dueInDays} days`).join('\n') +
-        `\n\nTotal Due within 7 Days: ${formatINR(totalDue)}.`
-      : 'No supplier bills are due within the next 7 days.';
-
-    basis = 'Accounts payable subledger filtered by due_in_days <= 7. Payments require human release authorization.';
-    sources = due7.map(p => p.id);
-  } else if (/mismatch|difference|exception/.test(qLower)) {
-    const mismatches = state.gstRows.filter(r => ['mismatch', 'books', 'portal'].includes(r.status));
-    answer = mismatches.map(
-      r => `• ${r.supplier} (${r.docNo}): Books ${r.booksTax ? formatINR(r.booksTax) : 'None'} vs Portal ${r.portalTax ? formatINR(r.portalTax) : 'None'} (${r.status.toUpperCase()})`
-    ).join('\n') || 'All GSTR-2B documents are matched or resolved.';
-
-    basis = 'Comparison between internal purchase register and imported GSTR-2B portal entries.';
-    sources = mismatches.map(r => r.docNo);
-  } else {
-    answer = `I can answer queries regarding overdue customer collections, 30-day cash flow adequacy, GST net liability & ITC reconciliation, upcoming supplier dues, or high-concurrency database architecture.`;
-    basis = 'Deterministic AI Munim calculation layer.';
-    sources = ['Financial Masters'];
+    res.json({
+      question,
+      answer: aiResult.answer,
+      basis: aiResult.basis,
+      sources: aiResult.sources,
+      providerUsed: aiResult.providerUsed,
+      modelUsed: aiResult.modelUsed,
+      timestamp: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to process AI query' });
   }
+});
 
-  accountingEngine.logAction('AI Munim', `Answered question: "${question.slice(0, 45)}"`, 'system');
-  broadcastStateUpdate();
+// Integrations Settings
+app.get('/api/settings/integrations', async (req: Request, res: Response) => {
+  const cfg = await getIntegrations();
+  const dbUrl = process.env.DATABASE_URL || cfg.databaseUrl || '';
+  const geminiKey = process.env.GEMINI_API_KEY || cfg.geminiApiKey || '';
+  const openaiKey = process.env.OPENAI_API_KEY || cfg.openaiApiKey || '';
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME || cfg.cloudinaryCloudName || '';
+  const cloudKey = process.env.CLOUDINARY_API_KEY || cfg.cloudinaryApiKey || '';
+  const gmailUser = process.env.GMAIL_USER || cfg.gmailUser || '';
+  const gmailPass = process.env.GMAIL_APP_PASSWORD || cfg.gmailAppPassword || '';
 
   res.json({
-    question,
-    answer,
-    basis,
-    sources,
-    timestamp: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
+    databaseUrlConfigured: !!dbUrl,
+    databaseUrlSnippet: dbUrl ? `${dbUrl.split('@')[1] ? '...@' + dbUrl.split('@')[1].slice(0, 20) + '...' : 'configured'}` : '',
+    activeAiProvider: cfg.activeAiProvider || (openaiKey ? 'openai' : 'gemini'),
+    geminiConfigured: !!geminiKey,
+    geminiModel: cfg.geminiModel || 'gemini-2.5-flash',
+    openaiConfigured: !!openaiKey,
+    openaiModel: cfg.openaiModel || 'gpt-4o-mini',
+    cloudinaryConfigured: !!(cloudName && cloudKey),
+    cloudinaryCloudName: cloudName || '',
+    gmailConfigured: !!(gmailUser && gmailPass),
+    gmailUser: gmailUser || '',
+    fromName: cfg.fromName || 'AI Munim Accounts',
+    appUrl: cfg.appUrl || 'http://localhost:3000'
   });
+});
+
+app.post('/api/settings/integrations', async (req: Request, res: Response) => {
+  const updates = req.body || {};
+  const filtered: Record<string, any> = {};
+  for (const [k, v] of Object.entries(updates)) {
+    if (typeof v === 'string' && v.trim() !== '' && !v.includes('••••')) {
+      filtered[k] = v.trim();
+    } else if (k === 'activeAiProvider' && (v === 'openai' || v === 'gemini')) {
+      filtered[k] = v;
+    }
+  }
+  const updated = await saveIntegrations(filtered);
+  res.json({ success: true, config: updated });
+});
+
+// Test Email Endpoint
+app.post('/api/settings/test-email', async (req: Request, res: Response) => {
+  const { toEmail } = req.body;
+  if (!toEmail) {
+    const verifyRes = await verifySmtp();
+    return res.status(verifyRes.success ? 200 : 400).json(verifyRes);
+  }
+  const result = await sendEmail({
+    to: toEmail,
+    subject: 'AI Munim: Gmail SMTP Integration Test',
+    text: `Greetings from AI Munim!\n\nThis confirms your Gmail SMTP is connected and operating successfully.\n\nTimestamp: ${new Date().toISOString()}`,
+    html: `
+      <div style="font-family: sans-serif; padding: 20px; color: #1e293b; max-width: 500px; border: 1px solid #e2e8f0; border-radius: 8px;">
+        <h2 style="color: #0d9488; margin-top: 0;">AI Munim Email System</h2>
+        <p>Your Gmail SMTP integration is connected and verified!</p>
+        <p style="background: #f1f5f9; padding: 12px; border-radius: 6px; font-size: 13px;">
+          <strong>Target:</strong> ${toEmail}<br/>
+          <strong>Time:</strong> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+        </p>
+        <p style="font-size: 12px; color: #64748b;">This email was dispatched via Nodemailer Gmail SMTP.</p>
+      </div>
+    `
+  });
+  if (result.success) {
+    res.json({ success: true, message: `Test email sent to ${toEmail}` });
+  } else {
+    res.status(400).json(result);
+  }
+});
+
+// Cloudinary Upload Endpoint
+app.post('/api/upload/cloudinary', async (req: Request, res: Response) => {
+  const { file, folder, publicId, resourceType } = req.body;
+  if (!file) {
+    return res.status(400).json({ error: 'Missing file payload' });
+  }
+  const result = await uploadToCloudinary(file, { folder, publicId, resourceType });
+  if (result.success) {
+    res.json(result);
+  } else {
+    res.status(400).json(result);
+  }
+});
+
+// Email Dispatch Endpoint
+app.post('/api/email/send', async (req: Request, res: Response) => {
+  const { to, subject, text, html, attachments } = req.body;
+  if (!to || !subject) {
+    return res.status(400).json({ error: 'Both "to" and "subject" are required' });
+  }
+  const result = await sendEmail({ to, subject, text, html, attachments });
+  if (result.success) {
+    res.json(result);
+  } else {
+    res.status(400).json(result);
+  }
 });
 
 // Settings

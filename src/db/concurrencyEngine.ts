@@ -213,6 +213,11 @@ export class HighConcurrencyAccountingEngine {
     return { ...this.state };
   }
 
+  public setState(newState: AppState): void {
+    this.state = { ...newState };
+    this.saveToStorage();
+  }
+
   // --- AUTHENTICATION & LOGIN REDIRECTION ---
   public loginUser(email: string, password?: string): { success: boolean; user?: User; redirectTab: string; message: string } {
     const user = this.state.users.find(u => u.email.toLowerCase() === email.toLowerCase());
